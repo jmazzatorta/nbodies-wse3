@@ -1,0 +1,52 @@
+// constants.csl
+
+// ----------------- IMPORTED PARAMETERS -----------------
+param grid_side       : u16;     // 32
+param N_TOTAL_BODIES  : u32;     // 16384
+param N_LOCAL         : u16;     // 16
+
+// ----------------- PHYSICS -----------------
+const SOFT_EPS_SQ : f32 = 0.0001;
+const G_GRAV      : f32 = 1.0;
+
+// ----------------- BUFFER LAYOUT -----------------
+const PARTICLE_FULL_SIZE    : u16 = 7;     // [x,y,z,vx,vy,vz,m]
+const PARTICLE_COMPACT_SIZE : u16 = 4;     // [x,y,z,m]
+const FORCE_SIZE : u16 = 3;
+const CHUNK_SIZE : u16 = N_LOCAL * PARTICLE_COMPACT_SIZE;     // 64
+
+// ----------------- RING -----------------
+const RING_LENGTH : u16 = grid_side * grid_side;     // 1024
+const TOTAL_CHUNKS_TO_RX : u16 = RING_LENGTH - 1;     // 1023
+
+// ----------------- ROUTING COLORS -----------------
+param color_fwd_in  : color;     // in-color for the FWD stream
+param color_fwd_out : color;     // out-color for the FWD stream
+param color_bwd_in  : color;     // in-color for the BWD stream
+param color_bwd_out : color;     // out-color for the BWD stream
+
+param has_fwd_in  : u16;     // 1 if PE has incoming FWD chunks, 0 otherwise
+param has_fwd_out : u16;     // 1 if PE emits on FWD, 0 otherwise
+param has_bwd_in  : u16;     // 1 if PE has incoming BWD chunks
+param has_bwd_out : u16;     // 1 if PE emits on BWD
+
+// ----------------- INPUT/OUTPUT QUEUES -----------------
+const fwd_in_iq   : input_queue  = @get_input_queue(2);
+const bwd_in_iq   : input_queue  = @get_input_queue(3);
+const fwd_out_oq  : output_queue = @get_output_queue(6);
+const bwd_out_oq  : output_queue = @get_output_queue(7);
+
+// ----------------- LOCAL TASK IDs -----------------
+const task_bootstrap_id       : local_task_id = @get_local_task_id(8);
+const task_self_compute_id    : local_task_id = @get_local_task_id(9);
+
+// FWD stream tasks
+const task_rx_fwd_complete_id : local_task_id = @get_local_task_id(10);
+const task_tx_fwd_complete_id : local_task_id = @get_local_task_id(11);
+
+// BWD stream tasks
+const task_rx_bwd_complete_id : local_task_id = @get_local_task_id(12);
+const task_tx_bwd_complete_id : local_task_id = @get_local_task_id(13);
+
+// Final teardown
+const task_finalize_id : local_task_id = @get_local_task_id(14);

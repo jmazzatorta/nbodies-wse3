@@ -1,0 +1,491 @@
+// pe.csl
+// Direct N-body force computation on Cerebras WSE-3.
+// BENCHMARK VERSION: no simprint, no canarino, with <time> instrumentation.
+//
+// === DESIGN: WORMHOLE ROUTING WITH ALTERNATING COLORS ===
+// see layout.csl for routing details.
+//
+// Timing is captured in three timestamps:
+//   tsc_start  : at the top of compute_step (just after enable_tsc)
+//   tsc_self   : after compute_self_forces + pack_own_chunk (start of pipeline)
+//   tsc_end    : in task_finalize (end of all drain/emit/compute pipeline)
+//
+// These are exported to host as ptr_time_buf_u16 (9 u16, 3 timestamps).
+
+// ===========================================================
+// SECTION 1 — IMPORTS AND PARAMS
+// ===========================================================
+
+param pe_x : u16;
+param pe_y : u16;
+
+param grid_side       : u16;
+param N_LOCAL         : u16;
+
+param color_fwd_in  : color;
+param color_fwd_out : color;
+param color_bwd_in  : color;
+param color_bwd_out : color;
+
+param has_fwd_in  : u16;
+param has_fwd_out : u16;
+param has_bwd_in  : u16;
+param has_bwd_out : u16;
+
+param memcpy_params : comptime_struct;
+
+const cons = @import_module("constants.csl", .{
+    .grid_side       = grid_side,
+    .N_LOCAL         = N_LOCAL,
+    .color_fwd_in    = color_fwd_in,
+    .color_fwd_out   = color_fwd_out,
+    .color_bwd_in    = color_bwd_in,
+    .color_bwd_out   = color_bwd_out,
+    .has_fwd_in      = has_fwd_in,
+    .has_fwd_out     = has_fwd_out,
+    .has_bwd_in      = has_bwd_in,
+    .has_bwd_out     = has_bwd_out,
+});
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const math      = @import_module("<math>");
+const timestamp = @import_module("<time>");
+
+// Shorthands.
+const N_LOC        = cons.N_LOCAL;
+const FULL_SIZE    = cons.PARTICLE_FULL_SIZE;
+const COMPACT_SIZE = cons.PARTICLE_COMPACT_SIZE;
+const FORCE_SIZE_C = cons.FORCE_SIZE;
+const CHUNK_SIZE   = cons.CHUNK_SIZE;
+
+// ===========================================================
+// SECTION 2 — STATE VARIABLES
+// ===========================================================
+
+export var local_particles = @zeros([N_LOC * FULL_SIZE]f32);
+var local_particles_ptr : [*]f32 = &local_particles;
+
+export var local_forces = @zeros([N_LOC * FORCE_SIZE_C]f32);
+var local_forces_ptr : [*]f32 = &local_forces;
+
+export var done = @zeros([1]u32);
+var done_ptr : [*]u32 = &done;
+
+export var n_pred_fwd = @zeros([1]u32);
+var n_pred_fwd_ptr : [*]u32 = &n_pred_fwd;
+export var n_pred_bwd = @zeros([1]u32);
+var n_pred_bwd_ptr : [*]u32 = &n_pred_bwd;
+
+// ----------------- TIMING BUFFERS -----------------
+// Three timestamps × 3 u16 each = 9 u16 total, exported as one buffer.
+// Order: [start_lo, start_mid, start_hi, self_lo, self_mid, self_hi,
+//         end_lo,   end_mid,   end_hi]
+//
+// Each PE measures its own deltas (t_self = tsc_self - tsc_start, etc.)
+// so the per-PE TSC offsets don't matter -- the host aggregates the deltas
+// across PEs (min/max/avg).
+export var time_buf_u16 = @zeros([9]u16);
+var time_buf_u16_ptr : [*]u16 = &time_buf_u16;
+
+// Internal timestamp buffers used by get_timestamp.
+var tsc_start  = @zeros([timestamp.tsc_size_words]u16);
+var tsc_self   = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end    = @zeros([timestamp.tsc_size_words]u16);
+
+// ----------------- RING BUFFERS -----------------
+var rx_chunk_fwd = @zeros([CHUNK_SIZE]f32);
+var rx_chunk_bwd = @zeros([CHUNK_SIZE]f32);
+var own_chunk    = @zeros([CHUNK_SIZE]f32);
+
+// ----------------- STREAM COUNTERS -----------------
+var fwd_drains_done     : u32 = 0;
+var fwd_drains_launched : u32 = 0;
+var fwd_emits_done      : u32 = 0;
+var fwd_emits_total     : u32 = 0;
+
+var bwd_drains_done     : u32 = 0;
+var bwd_drains_launched : u32 = 0;
+var bwd_emits_done      : u32 = 0;
+var bwd_emits_total     : u32 = 0;
+
+var finalize_triggered : u32 = 0;
+
+// ===========================================================
+// SECTION 3 — DSDs
+// ===========================================================
+
+const rx_fwd_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> rx_chunk_fwd[i]
+});
+const rx_bwd_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> rx_chunk_bwd[i]
+});
+const own_chunk_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> own_chunk[i]
+});
+
+const fwd_in_dsd = @get_dsd(fabin_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_fwd_in,
+    .input_queue  = cons.fwd_in_iq,
+});
+const bwd_in_dsd = @get_dsd(fabin_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_bwd_in,
+    .input_queue  = cons.bwd_in_iq,
+});
+
+const fwd_out_dsd = @get_dsd(fabout_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_fwd_out,
+    .output_queue = cons.fwd_out_oq,
+});
+const bwd_out_dsd = @get_dsd(fabout_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_bwd_out,
+    .output_queue = cons.bwd_out_oq,
+});
+
+// ===========================================================
+// SECTION 4 — COMPUTE FUNCTIONS
+// ===========================================================
+
+fn compute_self_forces() void {
+    for (@range(u16, N_LOC * FORCE_SIZE_C)) |k| {
+        local_forces[k] = 0.0;
+    }
+
+    for (@range(u16, N_LOC)) |i| {
+        const xi = local_particles[i * FULL_SIZE + 0];
+        const yi = local_particles[i * FULL_SIZE + 1];
+        const zi = local_particles[i * FULL_SIZE + 2];
+        const mi = local_particles[i * FULL_SIZE + 6];
+
+        for (@range(u16, N_LOC)) |j| {
+            if (j == i) continue;
+            if (j < i) continue;
+
+            const xj = local_particles[j * FULL_SIZE + 0];
+            const yj = local_particles[j * FULL_SIZE + 1];
+            const zj = local_particles[j * FULL_SIZE + 2];
+            const mj = local_particles[j * FULL_SIZE + 6];
+
+            const dx = xj - xi;
+            const dy = yj - yi;
+            const dz = zj - zi;
+            const r2_eps  = dx * dx + dy * dy + dz * dz + cons.SOFT_EPS_SQ;
+            const r       = math.sqrt(r2_eps);
+            const r3      = r * r2_eps;
+            const inv_r3  = 1.0 / r3;
+            const f_scalar = cons.G_GRAV * mi * mj * inv_r3;
+
+            const fx_pair = f_scalar * dx;
+            const fy_pair = f_scalar * dy;
+            const fz_pair = f_scalar * dz;
+
+            local_forces[i * FORCE_SIZE_C + 0] = local_forces[i * FORCE_SIZE_C + 0] + fx_pair;
+            local_forces[i * FORCE_SIZE_C + 1] = local_forces[i * FORCE_SIZE_C + 1] + fy_pair;
+            local_forces[i * FORCE_SIZE_C + 2] = local_forces[i * FORCE_SIZE_C + 2] + fz_pair;
+
+            local_forces[j * FORCE_SIZE_C + 0] = local_forces[j * FORCE_SIZE_C + 0] - fx_pair;
+            local_forces[j * FORCE_SIZE_C + 1] = local_forces[j * FORCE_SIZE_C + 1] - fy_pair;
+            local_forces[j * FORCE_SIZE_C + 2] = local_forces[j * FORCE_SIZE_C + 2] - fz_pair;
+        }
+    }
+}
+
+fn compute_chunk_forces(chunk: *[CHUNK_SIZE]f32) void {
+    for (@range(u16, N_LOC)) |i| {
+        const xi = local_particles[i * FULL_SIZE + 0];
+        const yi = local_particles[i * FULL_SIZE + 1];
+        const zi = local_particles[i * FULL_SIZE + 2];
+        const mi = local_particles[i * FULL_SIZE + 6];
+
+        var fx_acc : f32 = 0.0;
+        var fy_acc : f32 = 0.0;
+        var fz_acc : f32 = 0.0;
+
+        for (@range(u16, N_LOC)) |j| {
+            const xj = chunk.*[j * COMPACT_SIZE + 0];
+            const yj = chunk.*[j * COMPACT_SIZE + 1];
+            const zj = chunk.*[j * COMPACT_SIZE + 2];
+            const mj = chunk.*[j * COMPACT_SIZE + 3];
+
+            const dx = xj - xi;
+            const dy = yj - yi;
+            const dz = zj - zi;
+            const r2_eps  = dx * dx + dy * dy + dz * dz + cons.SOFT_EPS_SQ;
+            const r       = math.sqrt(r2_eps);
+            const r3      = r * r2_eps;
+            const inv_r3  = 1.0 / r3;
+            const f_scalar = cons.G_GRAV * mi * mj * inv_r3;
+
+            fx_acc = fx_acc + f_scalar * dx;
+            fy_acc = fy_acc + f_scalar * dy;
+            fz_acc = fz_acc + f_scalar * dz;
+        }
+
+        local_forces[i * FORCE_SIZE_C + 0] = local_forces[i * FORCE_SIZE_C + 0] + fx_acc;
+        local_forces[i * FORCE_SIZE_C + 1] = local_forces[i * FORCE_SIZE_C + 1] + fy_acc;
+        local_forces[i * FORCE_SIZE_C + 2] = local_forces[i * FORCE_SIZE_C + 2] + fz_acc;
+    }
+}
+
+fn pack_own_chunk() void {
+    for (@range(u16, N_LOC)) |i| {
+        own_chunk[i * COMPACT_SIZE + 0] = local_particles[i * FULL_SIZE + 0];
+        own_chunk[i * COMPACT_SIZE + 1] = local_particles[i * FULL_SIZE + 1];
+        own_chunk[i * COMPACT_SIZE + 2] = local_particles[i * FULL_SIZE + 2];
+        own_chunk[i * COMPACT_SIZE + 3] = local_particles[i * FULL_SIZE + 6];
+    }
+}
+
+// ===========================================================
+// SECTION 5 — DRAIN / EMIT HELPERS
+// ===========================================================
+
+fn launch_drain_fwd() void {
+    @mov32(rx_fwd_mem_dsd, fwd_in_dsd, .{
+        .async    = true,
+        .activate = cons.task_rx_fwd_complete_id,
+    });
+    fwd_drains_launched = fwd_drains_launched + 1;
+}
+
+fn launch_drain_bwd() void {
+    @mov32(rx_bwd_mem_dsd, bwd_in_dsd, .{
+        .async    = true,
+        .activate = cons.task_rx_bwd_complete_id,
+    });
+    bwd_drains_launched = bwd_drains_launched + 1;
+}
+
+fn launch_reemit_fwd() void {
+    @mov32(fwd_out_dsd, rx_fwd_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_fwd_complete_id,
+    });
+}
+
+fn launch_reemit_bwd() void {
+    @mov32(bwd_out_dsd, rx_bwd_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_bwd_complete_id,
+    });
+}
+
+fn launch_own_emit_fwd() void {
+    @mov32(fwd_out_dsd, own_chunk_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_fwd_complete_id,
+    });
+}
+
+fn launch_own_emit_bwd() void {
+    @mov32(bwd_out_dsd, own_chunk_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_bwd_complete_id,
+    });
+}
+
+// ===========================================================
+// SECTION 6 — FINALIZE GATE
+// ===========================================================
+
+fn check_finalize() void {
+    if (finalize_triggered != 0) return;
+
+    var fwd_done : bool = true;
+    if (has_fwd_in == 1) {
+        if (fwd_drains_done != n_pred_fwd[0]) { fwd_done = false; }
+    }
+    if (has_fwd_out == 1) {
+        if (fwd_emits_done != fwd_emits_total) { fwd_done = false; }
+    }
+
+    var bwd_done : bool = true;
+    if (has_bwd_in == 1) {
+        if (bwd_drains_done != n_pred_bwd[0]) { bwd_done = false; }
+    }
+    if (has_bwd_out == 1) {
+        if (bwd_emits_done != bwd_emits_total) { bwd_done = false; }
+    }
+
+    if (fwd_done and bwd_done) {
+        finalize_triggered = 1;
+        @activate(cons.task_finalize_id);
+    }
+}
+
+// ===========================================================
+// SECTION 7 — TIMING HELPERS
+// ===========================================================
+
+// Copy a 3-u16 timestamp into the exported buffer at the given word offset.
+fn store_ts(src: *[3]u16, dst_offset: u16) void {
+    time_buf_u16[dst_offset + 0] = src.*[0];
+    time_buf_u16[dst_offset + 1] = src.*[1];
+    time_buf_u16[dst_offset + 2] = src.*[2];
+}
+
+// ===========================================================
+// SECTION 8 — TASKS
+// ===========================================================
+
+task task_bootstrap() void {
+    if (has_fwd_out == 1) {
+        if (has_fwd_in == 1) {
+            fwd_emits_total = n_pred_fwd[0] + 1;
+        } else {
+            fwd_emits_total = 1;
+        }
+    } else {
+        fwd_emits_total = 0;
+    }
+
+    if (has_bwd_out == 1) {
+        if (has_bwd_in == 1) {
+            bwd_emits_total = n_pred_bwd[0] + 1;
+        } else {
+            bwd_emits_total = 1;
+        }
+    } else {
+        bwd_emits_total = 0;
+    }
+
+    if (has_fwd_out == 1) {
+        launch_own_emit_fwd();
+    } else if (has_fwd_in == 1) {
+        launch_drain_fwd();
+    }
+
+    if (has_bwd_out == 1) {
+        launch_own_emit_bwd();
+    } else if (has_bwd_in == 1) {
+        launch_drain_bwd();
+    }
+
+    check_finalize();
+}
+
+task task_rx_fwd_complete() void {
+    fwd_drains_done = fwd_drains_done + 1;
+
+    if (has_fwd_out == 1) {
+        launch_reemit_fwd();
+    }
+
+    compute_chunk_forces(&rx_chunk_fwd);
+
+    if (has_fwd_out == 0) {
+        if (fwd_drains_launched < n_pred_fwd[0]) {
+            launch_drain_fwd();
+        }
+        check_finalize();
+    }
+}
+
+task task_rx_bwd_complete() void {
+    bwd_drains_done = bwd_drains_done + 1;
+
+    if (has_bwd_out == 1) {
+        launch_reemit_bwd();
+    }
+
+    compute_chunk_forces(&rx_chunk_bwd);
+
+    if (has_bwd_out == 0) {
+        if (bwd_drains_launched < n_pred_bwd[0]) {
+            launch_drain_bwd();
+        }
+        check_finalize();
+    }
+}
+
+task task_tx_fwd_complete() void {
+    fwd_emits_done = fwd_emits_done + 1;
+
+    if (has_fwd_in == 1 and fwd_drains_launched < n_pred_fwd[0]) {
+        launch_drain_fwd();
+    }
+
+    check_finalize();
+}
+
+task task_tx_bwd_complete() void {
+    bwd_emits_done = bwd_emits_done + 1;
+
+    if (has_bwd_in == 1 and bwd_drains_launched < n_pred_bwd[0]) {
+        launch_drain_bwd();
+    }
+
+    check_finalize();
+}
+
+task task_finalize() void {
+    // Record end timestamp and copy all three timestamps into the
+    // exported buffer.
+    timestamp.get_timestamp(&tsc_end);
+    timestamp.disable_tsc();
+
+    store_ts(&tsc_start, 0);
+    store_ts(&tsc_self,  3);
+    store_ts(&tsc_end,   6);
+
+    done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+// ===========================================================
+// SECTION 9 — ENTRY POINT
+// ===========================================================
+
+export fn compute_step() void {
+    // Enable TSC and record the start timestamp.
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+
+    compute_self_forces();
+    pack_own_chunk();
+
+    // Record timestamp at the end of self_forces / start of pipeline.
+    timestamp.get_timestamp(&tsc_self);
+
+    @activate(cons.task_bootstrap_id);
+}
+
+// ===========================================================
+// SECTION 10 — COMPTIME BINDINGS
+// ===========================================================
+
+comptime {
+    @bind_local_task(task_bootstrap,         cons.task_bootstrap_id);
+    @bind_local_task(task_rx_fwd_complete,   cons.task_rx_fwd_complete_id);
+    @bind_local_task(task_rx_bwd_complete,   cons.task_rx_bwd_complete_id);
+    @bind_local_task(task_tx_fwd_complete,   cons.task_tx_fwd_complete_id);
+    @bind_local_task(task_tx_bwd_complete,   cons.task_tx_bwd_complete_id);
+    @bind_local_task(task_finalize,          cons.task_finalize_id);
+
+    if (@is_arch("wse3")) {
+        if (has_fwd_in == 1) {
+            @initialize_queue(cons.fwd_in_iq, .{ .color = color_fwd_in });
+        }
+        if (has_fwd_out == 1) {
+            @initialize_queue(cons.fwd_out_oq, .{ .color = color_fwd_out });
+        }
+        if (has_bwd_in == 1) {
+            @initialize_queue(cons.bwd_in_iq, .{ .color = color_bwd_in });
+        }
+        if (has_bwd_out == 1) {
+            @initialize_queue(cons.bwd_out_oq, .{ .color = color_bwd_out });
+        }
+    }
+
+    @export_symbol(local_particles_ptr, "ptr_local_particles");
+    @export_symbol(local_forces_ptr,    "ptr_local_forces");
+    @export_symbol(done_ptr,            "ptr_done");
+    @export_symbol(n_pred_fwd_ptr,      "ptr_n_pred_fwd");
+    @export_symbol(n_pred_bwd_ptr,      "ptr_n_pred_bwd");
+    @export_symbol(time_buf_u16_ptr,    "ptr_time_buf_u16");
+    @export_symbol(compute_step);
+}
