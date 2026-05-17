@@ -1,0 +1,228 @@
+{
+  "config": {
+    "side": 32,
+    "n_local": 1,
+    "n_total": 1024,
+    "total_pe": 1024,
+    "n_steps": 10,
+    "dt_num": 1,
+    "dt_den": 10000,
+    "dt": 0.0001
+  },
+  "per_step_cycles": [
+    {
+      "step": 0,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321370,
+        "max": 334173,
+        "avg": 327738
+      },
+      "t_total": {
+        "min": 321519,
+        "max": 334322,
+        "avg": 327887
+      }
+    },
+    {
+      "step": 1,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321405,
+        "max": 331630,
+        "avg": 323971
+      },
+      "t_total": {
+        "min": 321554,
+        "max": 331779,
+        "avg": 324120
+      }
+    },
+    {
+      "step": 2,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321403,
+        "max": 333670,
+        "avg": 324482
+      },
+      "t_total": {
+        "min": 321552,
+        "max": 333819,
+        "avg": 324631
+      }
+    },
+    {
+      "step": 3,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321406,
+        "max": 333670,
+        "avg": 324483
+      },
+      "t_total": {
+        "min": 321555,
+        "max": 333819,
+        "avg": 324632
+      }
+    },
+    {
+      "step": 4,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321406,
+        "max": 333670,
+        "avg": 324477
+      },
+      "t_total": {
+        "min": 321555,
+        "max": 333819,
+        "avg": 324626
+      }
+    },
+    {
+      "step": 5,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321406,
+        "max": 333670,
+        "avg": 324478
+      },
+      "t_total": {
+        "min": 321555,
+        "max": 333819,
+        "avg": 324627
+      }
+    },
+    {
+      "step": 6,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321406,
+        "max": 333670,
+        "avg": 324477
+      },
+      "t_total": {
+        "min": 321555,
+        "max": 333819,
+        "avg": 324626
+      }
+    },
+    {
+      "step": 7,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321406,
+        "max": 333670,
+        "avg": 324477
+      },
+      "t_total": {
+        "min": 321555,
+        "max": 333819,
+        "avg": 324626
+      }
+    },
+    {
+      "step": 8,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321405,
+        "max": 333670,
+        "avg": 324477
+      },
+      "t_total": {
+        "min": 321554,
+        "max": 333819,
+        "avg": 324626
+      }
+    },
+    {
+      "step": 9,
+      "t_self": {
+        "min": 149,
+        "max": 149,
+        "avg": 149
+      },
+      "t_pipeline": {
+        "min": 321406,
+        "max": 333670,
+        "avg": 324477
+      },
+      "t_total": {
+        "min": 321555,
+        "max": 333819,
+        "avg": 324626
+      }
+    }
+  ],
+  "aggregate_cycles": {
+    "t_self": {
+      "min": 149,
+      "max": 149,
+      "avg": 149
+    },
+    "t_pipeline": {
+      "min": 321370,
+      "max": 334173,
+      "avg": 324754
+    },
+    "t_total": {
+      "min": 321519,
+      "max": 334322,
+      "avg": 324903
+    }
+  },
+  "ms_at_850MHz": {
+    "t_self_avg": 0.00017529411764705884,
+    "t_pipeline_avg": 0.38206352941176475,
+    "t_total_avg": 0.3822388235294118
+  },
+  "host_wallclock_s": {
+    "push": 0.00039839744567871094,
+    "launch": 0.000102996826171875,
+    "pull": 3960.220425605774
+  },
+  "throughput": {
+    "n_pairs_per_step": 1047552,
+    "pairs_per_sec_est": 2663358079.934913
+  },
+  "sanity": {
+    "n_bodies_nonzero_force": 1024
+  }
+}

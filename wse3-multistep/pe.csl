@@ -1,0 +1,722 @@
+// pe.csl
+// Direct N-body force computation on Cerebras WSE-3.
+//
+// === DESIGN: WORMHOLE ROUTING WITH ALTERNATING COLORS ===
+//
+// Each PE drains a chunk on color_fwd_in, runs compute_chunk_forces,
+// then re-emits it on color_fwd_out. After draining all
+// `n_pred_fwd` predecessor chunks, it emits its OWN chunk on color_fwd_out.
+// Same logic mirrors for the BWD stream, on color_bwd_in / color_bwd_out.
+//
+// Origin (FWD) only emits; terminus (FWD) only drains; intermediates
+// drain + re-emit + emit own.
+//
+// Sequencing: drain async -> task_rx_complete -> emit async (re-emit) ->
+// task_tx_complete -> next drain (or own emit).
+
+// ===========================================================
+// SECTION 1 — IMPORTS AND PARAMS
+// ===========================================================
+
+// Per-PE coordinates (set at compile time by layout.csl).
+param pe_x : u16;
+param pe_y : u16;
+
+// Constants from layout.
+param side            : u16;     // 32, 64, 128
+param N_LOCAL         : u16;     // 1, 2, 4, 8, 16
+param N_STEPS         : u16;     // number of leapfrog steps
+param DT_NUM          : u32;     // timestep numerator
+param DT_DEN          : u32;     // timestep denominator
+
+// Routing colors (assigned per-PE by layout, may alternate).
+param color_fwd_in  : color;
+param color_fwd_out : color;
+param color_bwd_in  : color;
+param color_bwd_out : color;
+
+// Whether this PE has each color (origin/terminus PEs have only some).
+param has_fwd_in  : u16;
+param has_fwd_out : u16;
+param has_bwd_in  : u16;
+param has_bwd_out : u16;
+
+// Memcpy params (passed through from layout).
+param memcpy_params : comptime_struct;
+
+// Imports.
+const cons = @import_module("constants.csl", .{
+    .side            = side,
+    .N_LOCAL         = N_LOCAL,
+    .N_STEPS         = N_STEPS,
+    .DT_NUM          = DT_NUM,
+    .DT_DEN          = DT_DEN,
+    .color_fwd_in    = color_fwd_in,
+    .color_fwd_out   = color_fwd_out,
+    .color_bwd_in    = color_bwd_in,
+    .color_bwd_out   = color_bwd_out,
+    .has_fwd_in      = has_fwd_in,
+    .has_fwd_out     = has_fwd_out,
+    .has_bwd_in      = has_bwd_in,
+    .has_bwd_out     = has_bwd_out,
+});
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const math      = @import_module("<math>");
+const timestamp = @import_module("<time>");
+
+// Shorthands.
+const N_LOC        = cons.N_LOCAL;                  // 16
+const FULL_SIZE    = cons.PARTICLE_FULL_SIZE;       // 7
+const COMPACT_SIZE = cons.PARTICLE_COMPACT_SIZE;    // 4
+const FORCE_SIZE_C = cons.FORCE_SIZE;               // 3
+const CHUNK_SIZE   = cons.CHUNK_SIZE;               // 64
+
+// ===========================================================
+// SECTION 2 — STATE VARIABLES
+// ===========================================================
+
+// ----------------- LOCAL PARTICLE STATE -----------------
+// 7 floats per particle: x, y, z, vx, vy, vz, m
+export var local_particles = @zeros([N_LOC * FULL_SIZE]f32);
+var local_particles_ptr : [*]f32 = &local_particles;
+
+// 3 floats per particle: fx, fy, fz
+export var local_forces = @zeros([N_LOC * FORCE_SIZE_C]f32);
+var local_forces_ptr : [*]f32 = &local_forces;
+
+// Done flag (host polls this).
+export var done = @zeros([1]u32);
+var done_ptr : [*]u32 = &done;
+
+// ----------------- HOST-PUSHED RING TOPOLOGY -----------------
+// `n_pred_fwd[0]` = number of FWD predecessor chunks this PE will drain.
+// `n_pred_bwd[0]` = number of BWD predecessor chunks this PE will drain.
+export var n_pred_fwd = @zeros([1]u32);
+var n_pred_fwd_ptr : [*]u32 = &n_pred_fwd;
+export var n_pred_bwd = @zeros([1]u32);
+var n_pred_bwd_ptr : [*]u32 = &n_pred_bwd;
+
+// ----------------- TIMING BUFFERS -----------------
+// Exported timing buffer: 9 u16 per task_integrate iteration, for N_STEPS+1
+// iterations (covers steps 0..N_STEPS inclusive: pipeline for a_0..a_N).
+// Per iteration s, layout is [start_lo, start_mid, start_hi,
+//                             self_lo,  self_mid,  self_hi,
+//                             end_lo,   end_mid,   end_hi].
+// Each PE measures its own deltas locally; the host aggregates across PEs.
+export var time_buf_u16 = @zeros([9 * (N_STEPS + 1)]u16);
+var time_buf_u16_ptr : [*]u16 = &time_buf_u16;
+
+// Internal scratch timestamp buffers (3 u16 each, reused across steps).
+var tsc_start = @zeros([timestamp.tsc_size_words]u16);
+var tsc_self  = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end   = @zeros([timestamp.tsc_size_words]u16);
+
+// ----------------- RING BUFFERS -----------------
+// Receive buffers: filled by drain async ops. Compact form (xyz+m).
+// We emit re-emits directly from these buffers (the emit microthread
+// reads, never writes -- the next drain only writes after emit AND
+// compute have finished, sequenced via tx_complete).
+var rx_chunk_fwd = @zeros([CHUNK_SIZE]f32);
+var rx_chunk_bwd = @zeros([CHUNK_SIZE]f32);
+
+// Our own chunk in compact form, packed once at start of compute_step.
+// We emit directly from this buffer when it's our turn.
+var own_chunk = @zeros([CHUNK_SIZE]f32);
+
+// ----------------- STREAM COUNTERS -----------------
+// FWD stream
+var fwd_drains_done     : u32 = 0;     // chunks drained (completed) from predecessors
+var fwd_drains_launched : u32 = 0;     // drains launched (in flight + completed)
+var fwd_emits_done      : u32 = 0;     // emit ops completed
+var fwd_emits_total     : u32 = 0;     // expected total emits
+
+// BWD stream
+var bwd_drains_done     : u32 = 0;
+var bwd_drains_launched : u32 = 0;
+var bwd_emits_done      : u32 = 0;
+var bwd_emits_total     : u32 = 0;
+
+// Finalize gate (set to 1 the first time finalize fires).
+var finalize_triggered : u32 = 0;
+
+// Multistep: current leapfrog step counter (0..N_STEPS).
+//   - At entry to task_integrate with current_step=0: apply half-kick-backward,
+//     then full-kick + drift, then ++ to 1, then re-launch pipeline.
+//   - With 0 < current_step < N_STEPS: full-kick + drift + ++ + re-launch.
+//   - With current_step == N_STEPS: apply half-kick-forward, then finalize.
+var current_step : u32 = 0;
+
+// ===========================================================
+// SECTION 3 — DSDs
+// ===========================================================
+
+// Memory-side DSDs for the chunk buffers.
+const rx_fwd_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> rx_chunk_fwd[i]
+});
+const rx_bwd_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> rx_chunk_bwd[i]
+});
+const own_chunk_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> own_chunk[i]
+});
+
+// Fabin DSDs for drains. Each PE creates the DSD only if the
+// corresponding has_*_in flag is 1; CSL does not allow conditional
+// DSDs at file scope, so we build them unconditionally and rely on the
+// drain task being skipped by the runtime when not needed.
+//
+// On WSE-3 the input/output queues must be initialized only for
+// the colors actually in use (otherwise initialize_queue with an
+// unused color is illegal). Both fabin and queue init are guarded by
+// the corresponding has_*_in / has_*_out flag below.
+const fwd_in_dsd = @get_dsd(fabin_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_fwd_in,
+    .input_queue  = cons.fwd_in_iq,
+});
+const bwd_in_dsd = @get_dsd(fabin_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_bwd_in,
+    .input_queue  = cons.bwd_in_iq,
+});
+
+const fwd_out_dsd = @get_dsd(fabout_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_fwd_out,
+    .output_queue = cons.fwd_out_oq,
+});
+const bwd_out_dsd = @get_dsd(fabout_dsd, .{
+    .extent       = CHUNK_SIZE,
+    .fabric_color = color_bwd_out,
+    .output_queue = cons.bwd_out_oq,
+});
+
+// ===========================================================
+// SECTION 4 — COMPUTE FUNCTIONS
+// ===========================================================
+
+// Compute pairwise force between i and j and ADD to (fx, fy, fz).
+// Uses Plummer softening: F = G * m_i * m_j * r_vec / (r^2 + eps^2)^(3/2).
+
+fn compute_self_forces() void {
+    // Zero force accumulator.
+    for (@range(u16, N_LOC * FORCE_SIZE_C)) |k| {
+        local_forces[k] = 0.0;
+    }
+
+    for (@range(u16, N_LOC)) |i| {
+        const xi = local_particles[i * FULL_SIZE + 0];
+        const yi = local_particles[i * FULL_SIZE + 1];
+        const zi = local_particles[i * FULL_SIZE + 2];
+        const mi = local_particles[i * FULL_SIZE + 6];
+
+        for (@range(u16, N_LOC)) |j| {
+            if (j == i) continue;
+            if (j < i) continue;
+
+            const xj = local_particles[j * FULL_SIZE + 0];
+            const yj = local_particles[j * FULL_SIZE + 1];
+            const zj = local_particles[j * FULL_SIZE + 2];
+            const mj = local_particles[j * FULL_SIZE + 6];
+
+            const dx = xj - xi;
+            const dy = yj - yi;
+            const dz = zj - zi;
+            const r2_eps  = dx * dx + dy * dy + dz * dz + cons.SOFT_EPS_SQ;
+            const r       = math.sqrt(r2_eps);
+            const r3      = r * r2_eps;
+            const inv_r3  = 1.0 / r3;
+            const f_scalar = cons.G_GRAV * mi * mj * inv_r3;
+
+            const fx_pair = f_scalar * dx;
+            const fy_pair = f_scalar * dy;
+            const fz_pair = f_scalar * dz;
+
+            local_forces[i * FORCE_SIZE_C + 0] = local_forces[i * FORCE_SIZE_C + 0] + fx_pair;
+            local_forces[i * FORCE_SIZE_C + 1] = local_forces[i * FORCE_SIZE_C + 1] + fy_pair;
+            local_forces[i * FORCE_SIZE_C + 2] = local_forces[i * FORCE_SIZE_C + 2] + fz_pair;
+
+            // Newton's 3rd law on j.
+            local_forces[j * FORCE_SIZE_C + 0] = local_forces[j * FORCE_SIZE_C + 0] - fx_pair;
+            local_forces[j * FORCE_SIZE_C + 1] = local_forces[j * FORCE_SIZE_C + 1] - fy_pair;
+            local_forces[j * FORCE_SIZE_C + 2] = local_forces[j * FORCE_SIZE_C + 2] - fz_pair;
+        }
+    }
+}
+
+fn compute_chunk_forces(chunk: *[CHUNK_SIZE]f32) void {
+    for (@range(u16, N_LOC)) |i| {
+        const xi = local_particles[i * FULL_SIZE + 0];
+        const yi = local_particles[i * FULL_SIZE + 1];
+        const zi = local_particles[i * FULL_SIZE + 2];
+        const mi = local_particles[i * FULL_SIZE + 6];
+
+        var fx_acc : f32 = 0.0;
+        var fy_acc : f32 = 0.0;
+        var fz_acc : f32 = 0.0;
+
+        for (@range(u16, N_LOC)) |j| {
+            const xj = chunk.*[j * COMPACT_SIZE + 0];
+            const yj = chunk.*[j * COMPACT_SIZE + 1];
+            const zj = chunk.*[j * COMPACT_SIZE + 2];
+            const mj = chunk.*[j * COMPACT_SIZE + 3];
+
+            const dx = xj - xi;
+            const dy = yj - yi;
+            const dz = zj - zi;
+            const r2_eps  = dx * dx + dy * dy + dz * dz + cons.SOFT_EPS_SQ;
+            const r       = math.sqrt(r2_eps);
+            const r3      = r * r2_eps;
+            const inv_r3  = 1.0 / r3;
+            const f_scalar = cons.G_GRAV * mi * mj * inv_r3;
+
+            fx_acc = fx_acc + f_scalar * dx;
+            fy_acc = fy_acc + f_scalar * dy;
+            fz_acc = fz_acc + f_scalar * dz;
+        }
+
+        local_forces[i * FORCE_SIZE_C + 0] = local_forces[i * FORCE_SIZE_C + 0] + fx_acc;
+        local_forces[i * FORCE_SIZE_C + 1] = local_forces[i * FORCE_SIZE_C + 1] + fy_acc;
+        local_forces[i * FORCE_SIZE_C + 2] = local_forces[i * FORCE_SIZE_C + 2] + fz_acc;
+    }
+}
+
+// Pack own (xyz, m) into compact own_chunk.
+fn pack_own_chunk() void {
+    for (@range(u16, N_LOC)) |i| {
+        own_chunk[i * COMPACT_SIZE + 0] = local_particles[i * FULL_SIZE + 0];
+        own_chunk[i * COMPACT_SIZE + 1] = local_particles[i * FULL_SIZE + 1];
+        own_chunk[i * COMPACT_SIZE + 2] = local_particles[i * FULL_SIZE + 2];
+        own_chunk[i * COMPACT_SIZE + 3] = local_particles[i * FULL_SIZE + 6];
+    }
+}
+
+// ===========================================================
+// SECTION 5 — DRAIN / EMIT HELPERS
+// ===========================================================
+
+fn launch_drain_fwd() void {
+    @mov32(rx_fwd_mem_dsd, fwd_in_dsd, .{
+        .async    = true,
+        .activate = cons.task_rx_fwd_complete_id,
+    });
+    fwd_drains_launched = fwd_drains_launched + 1;
+}
+
+fn launch_drain_bwd() void {
+    @mov32(rx_bwd_mem_dsd, bwd_in_dsd, .{
+        .async    = true,
+        .activate = cons.task_rx_bwd_complete_id,
+    });
+    bwd_drains_launched = bwd_drains_launched + 1;
+}
+
+// Re-emit: the source is rx_chunk_*. Safe because the next drain
+// (which writes rx_chunk_*) is launched only after BOTH the emit
+// and the compute on the same buffer have finished (sequenced via
+// task_tx_*_complete).
+fn launch_reemit_fwd() void {
+    @mov32(fwd_out_dsd, rx_fwd_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_fwd_complete_id,
+    });
+}
+
+fn launch_reemit_bwd() void {
+    @mov32(bwd_out_dsd, rx_bwd_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_bwd_complete_id,
+    });
+}
+
+// Own emit: the source is own_chunk (packed once and never modified).
+fn launch_own_emit_fwd() void {
+    @mov32(fwd_out_dsd, own_chunk_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_fwd_complete_id,
+    });
+}
+
+fn launch_own_emit_bwd() void {
+    @mov32(bwd_out_dsd, own_chunk_mem_dsd, .{
+        .async    = true,
+        .activate = cons.task_tx_bwd_complete_id,
+    });
+}
+
+// ===========================================================
+// SECTION 6 — FINALIZE GATE
+// ===========================================================
+
+fn check_finalize() void {
+    if (finalize_triggered != 0) return;
+
+    // FWD stream done?
+    //   If has_fwd_in == 1: we expected n_pred_fwd[0] drains; done when
+    //                       fwd_drains_done == n_pred_fwd[0].
+    //   If has_fwd_in == 0: trivially done (no drains expected).
+    //   If has_fwd_out == 1: we expected fwd_emits_total emits.
+    //   If has_fwd_out == 0: no emits expected.
+    var fwd_done : bool = true;
+    if (has_fwd_in == 1) {
+        if (fwd_drains_done != n_pred_fwd[0]) { fwd_done = false; }
+    }
+    if (has_fwd_out == 1) {
+        if (fwd_emits_done != fwd_emits_total) { fwd_done = false; }
+    }
+
+    var bwd_done : bool = true;
+    if (has_bwd_in == 1) {
+        if (bwd_drains_done != n_pred_bwd[0]) { bwd_done = false; }
+    }
+    if (has_bwd_out == 1) {
+        if (bwd_emits_done != bwd_emits_total) { bwd_done = false; }
+    }
+
+    if (fwd_done and bwd_done) {
+        finalize_triggered = 1;
+        // Activate the integrate task which decides whether to continue
+        // with another leapfrog step or finalize.
+        @activate(cons.task_integrate_id);
+    }
+}
+
+// ===========================================================
+// SECTION 7 — TASKS
+// ===========================================================
+
+// ----------------- TASK: bootstrap -----------------
+// Activated by compute_step after self-forces and pack_own_chunk.
+// Initializes counters, launches first drains, and (for ring origins)
+// emits the own chunk immediately.
+task task_bootstrap() void {
+
+    // Compute total emits expected on each stream.
+    //   FWD intermediate (has_in=1, has_out=1): emits = n_pred_fwd + 1.
+    //   FWD origin (has_in=0, has_out=1):       emits = 1.
+    //   FWD terminus (has_in=1, has_out=0):     emits = 0.
+    if (has_fwd_out == 1) {
+        if (has_fwd_in == 1) {
+            fwd_emits_total = n_pred_fwd[0] + 1;
+        } else {
+            fwd_emits_total = 1;
+        }
+    } else {
+        fwd_emits_total = 0;
+    }
+
+    if (has_bwd_out == 1) {
+        if (has_bwd_in == 1) {
+            bwd_emits_total = n_pred_bwd[0] + 1;
+        } else {
+            bwd_emits_total = 1;
+        }
+    } else {
+        bwd_emits_total = 0;
+    }
+
+    // Every PE emits its OWN chunk immediately at bootstrap (on the
+    // colors where has_*_out == 1). This eliminates the startup
+    // latency where intermediate PEs would otherwise idle until the
+    // wave from the origin reaches them.
+    //
+    // For intermediates, the first drain is NOT launched here -- it
+    // will be launched from task_tx_complete (once the own_emit
+    // finishes). This avoids concurrent use of the same input queue's
+    // microthread by multiple drains. The own_emit takes ~70 cycles,
+    // negligible compared to the startup latency we save (~15000 cycles
+    // for the central PEs in the previous design).
+    //
+    // For terminus PEs (has_*_out == 0): no own_emit, so we launch the
+    // first drain here directly.
+
+    if (has_fwd_out == 1) {
+        launch_own_emit_fwd();
+    } else if (has_fwd_in == 1) {
+        launch_drain_fwd();
+    }
+
+    if (has_bwd_out == 1) {
+        launch_own_emit_bwd();
+    } else if (has_bwd_in == 1) {
+        launch_drain_bwd();
+    }
+
+    check_finalize();
+}
+
+// ----------------- TASK: rx_fwd_complete -----------------
+// One FWD chunk has been drained into rx_chunk_fwd.
+//
+// Pipeline order (per chunk):
+//   (1) Launch re-emit (microthread ut6 reads rx_chunk_fwd, writes fabric).
+//   (2) Compute forces on rx_chunk_fwd (CE, in parallel with the re-emit).
+//   (3) Return from task. The re-emit may still be in flight.
+//   (4) When the re-emit completes, task_tx_fwd_complete fires and
+//       launches the NEXT drain (which will overwrite rx_chunk_fwd).
+//
+// Concurrent access on rx_chunk_fwd:
+//   - emit microthread: read only (step 1, until step 4).
+//   - compute (step 2): read only.
+//   - next drain (step 4+): write. Starts only AFTER re-emit completes,
+//     so no overlap with read.
+//
+// This means the buffer is safely accessed even with double readers.
+task task_rx_fwd_complete() void {
+    fwd_drains_done = fwd_drains_done + 1;
+
+    if (has_fwd_out == 1) {
+        launch_reemit_fwd();
+    }
+
+    compute_chunk_forces(&rx_chunk_fwd);
+
+    if (has_fwd_out == 0) {
+        // Terminus FWD: no re-emit, so we launch the next drain here.
+        if (fwd_drains_launched < n_pred_fwd[0]) {
+            launch_drain_fwd();
+        }
+        check_finalize();
+    }
+    // else: tx_fwd_complete fires after re-emit completes and launches
+    // the next drain.
+}
+
+// ----------------- TASK: rx_bwd_complete -----------------
+task task_rx_bwd_complete() void {
+    bwd_drains_done = bwd_drains_done + 1;
+
+    if (has_bwd_out == 1) {
+        launch_reemit_bwd();
+    }
+
+    compute_chunk_forces(&rx_chunk_bwd);
+
+    if (has_bwd_out == 0) {
+        if (bwd_drains_launched < n_pred_bwd[0]) {
+            launch_drain_bwd();
+        }
+        check_finalize();
+    }
+}
+
+// ----------------- TASK: tx_fwd_complete -----------------
+// One FWD emit just finished (either the bootstrap own-emit, or a re-emit).
+// If we still need to drain more chunks AND have not yet launched a drain
+// for the next one, launch it now. (For intermediate PEs, the first drain
+// is launched at bootstrap in parallel with own_emit, so we skip launching
+// here for the very first tx_complete -- the `fwd_drains_launched < n_pred_fwd`
+// guard handles this.)
+task task_tx_fwd_complete() void {
+    fwd_emits_done = fwd_emits_done + 1;
+
+    if (has_fwd_in == 1 and fwd_drains_launched < n_pred_fwd[0]) {
+        launch_drain_fwd();
+    }
+
+    check_finalize();
+}
+
+// ----------------- TASK: tx_bwd_complete -----------------
+task task_tx_bwd_complete() void {
+    bwd_emits_done = bwd_emits_done + 1;
+
+    if (has_bwd_in == 1 and bwd_drains_launched < n_pred_bwd[0]) {
+        launch_drain_bwd();
+    }
+
+    check_finalize();
+}
+
+// ----------------- TASK: integrate -----------------
+// Activated from check_finalize when all drains/emits of the current
+// pipeline iteration are done (local_forces now contains a_current * m).
+//
+// Leapfrog KDK with initial half-kick-backward and final half-kick-forward:
+//
+//   Entry with current_step == 0       (first integrate after a_0 pipeline):
+//     v <- v - a*HALF_DT       (half kick backward; centers v on half-steps)
+//     v <- v + a*DT            (full kick: v_{1/2} = v_{-1/2} + a_0 * dt)
+//     x <- x + v*DT            (drift: x_1 = x_0 + v_{1/2} * dt)
+//     current_step = 1; reset counters; relaunch pipeline for a_1.
+//
+//   Entry with 0 < current_step < N_STEPS:
+//     v <- v + a*DT            (full kick)
+//     x <- x + v*DT            (drift)
+//     current_step++; reset counters; relaunch pipeline.
+//
+//   Entry with current_step == N_STEPS (final integrate after a_N pipeline):
+//     v <- v + a*HALF_DT       (half kick forward; recenter v on timestep N)
+//     Activate task_finalize.
+//
+// Note: local_forces stores F = m*a, so the velocity update uses F/m * dt.
+task task_integrate() void {
+    // Record end timestamp of the just-completed pipeline iteration.
+    timestamp.get_timestamp(&tsc_end);
+    store_ts(&tsc_end, ts_slot(current_step, 6));
+
+    if (current_step == @as(u32, N_STEPS)) {
+        // ----- FINAL: half kick forward, then finalize -----
+        for (@range(u16, N_LOC)) |i| {
+            const m = local_particles[i * FULL_SIZE + 6];
+            const inv_m = 1.0 / m;
+            local_particles[i * FULL_SIZE + 3] = local_particles[i * FULL_SIZE + 3]
+                + local_forces[i * FORCE_SIZE_C + 0] * inv_m * cons.HALF_DT;
+            local_particles[i * FULL_SIZE + 4] = local_particles[i * FULL_SIZE + 4]
+                + local_forces[i * FORCE_SIZE_C + 1] * inv_m * cons.HALF_DT;
+            local_particles[i * FULL_SIZE + 5] = local_particles[i * FULL_SIZE + 5]
+                + local_forces[i * FORCE_SIZE_C + 2] * inv_m * cons.HALF_DT;
+        }
+        timestamp.disable_tsc();
+        @activate(cons.task_finalize_id);
+        return;
+    }
+
+    // ----- INITIAL (only at current_step==0): half kick backward -----
+    if (current_step == 0) {
+        for (@range(u16, N_LOC)) |i| {
+            const m = local_particles[i * FULL_SIZE + 6];
+            const inv_m = 1.0 / m;
+            local_particles[i * FULL_SIZE + 3] = local_particles[i * FULL_SIZE + 3]
+                - local_forces[i * FORCE_SIZE_C + 0] * inv_m * cons.HALF_DT;
+            local_particles[i * FULL_SIZE + 4] = local_particles[i * FULL_SIZE + 4]
+                - local_forces[i * FORCE_SIZE_C + 1] * inv_m * cons.HALF_DT;
+            local_particles[i * FULL_SIZE + 5] = local_particles[i * FULL_SIZE + 5]
+                - local_forces[i * FORCE_SIZE_C + 2] * inv_m * cons.HALF_DT;
+        }
+    }
+
+    // ----- STANDARD STEP: full kick + drift -----
+    for (@range(u16, N_LOC)) |i| {
+        const m = local_particles[i * FULL_SIZE + 6];
+        const inv_m = 1.0 / m;
+
+        // Full kick: v += a * DT = (F/m) * DT
+        local_particles[i * FULL_SIZE + 3] = local_particles[i * FULL_SIZE + 3]
+            + local_forces[i * FORCE_SIZE_C + 0] * inv_m * cons.DT;
+        local_particles[i * FULL_SIZE + 4] = local_particles[i * FULL_SIZE + 4]
+            + local_forces[i * FORCE_SIZE_C + 1] * inv_m * cons.DT;
+        local_particles[i * FULL_SIZE + 5] = local_particles[i * FULL_SIZE + 5]
+            + local_forces[i * FORCE_SIZE_C + 2] * inv_m * cons.DT;
+
+        // Drift: x += v * DT
+        local_particles[i * FULL_SIZE + 0] = local_particles[i * FULL_SIZE + 0]
+            + local_particles[i * FULL_SIZE + 3] * cons.DT;
+        local_particles[i * FULL_SIZE + 1] = local_particles[i * FULL_SIZE + 1]
+            + local_particles[i * FULL_SIZE + 4] * cons.DT;
+        local_particles[i * FULL_SIZE + 2] = local_particles[i * FULL_SIZE + 2]
+            + local_particles[i * FULL_SIZE + 5] * cons.DT;
+    }
+
+    // ----- PREPARE NEXT PIPELINE -----
+    current_step = current_step + 1;
+
+    // Reset stream counters for the new pipeline iteration.
+    fwd_drains_done     = 0;
+    fwd_drains_launched = 0;
+    fwd_emits_done      = 0;
+    bwd_drains_done     = 0;
+    bwd_drains_launched = 0;
+    bwd_emits_done      = 0;
+    finalize_triggered  = 0;
+
+    // Record start of the new step BEFORE compute_self_forces.
+    timestamp.get_timestamp(&tsc_start);
+
+    // Recompute self forces (positions have changed) and re-pack own chunk.
+    compute_self_forces();
+    pack_own_chunk();
+
+    // Record end-of-self timestamp for the new step.
+    timestamp.get_timestamp(&tsc_self);
+
+    // Store start/self timestamps in the exported buffer.
+    store_ts(&tsc_start, ts_slot(current_step, 0));
+    store_ts(&tsc_self,  ts_slot(current_step, 3));
+
+    @activate(cons.task_bootstrap_id);
+}
+
+// ----------------- TASK: finalize -----------------
+task task_finalize() void {
+    done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+// ===========================================================
+// SECTION 8 — TIMING HELPERS
+// ===========================================================
+
+// Copy a 3-u16 timestamp into the exported buffer at the given word offset.
+fn store_ts(src: *[3]u16, dst_offset: u32) void {
+    time_buf_u16[dst_offset + 0] = src.*[0];
+    time_buf_u16[dst_offset + 1] = src.*[1];
+    time_buf_u16[dst_offset + 2] = src.*[2];
+}
+
+// Slot offset for step s, timestamp kind (start=0, self=3, end=6).
+// Each step gets 9 words; step s starts at 9*s.
+fn ts_slot(step: u32, kind: u32) u32 {
+    return step * @as(u32, 9) + kind;
+}
+
+// ===========================================================
+// SECTION 9 — ENTRY POINT
+// ===========================================================
+
+export fn compute_step() void {
+    // Enable TSC and record start of step 0.
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+
+    compute_self_forces();
+    pack_own_chunk();
+
+    // Record end-of-self timestamp for step 0.
+    timestamp.get_timestamp(&tsc_self);
+
+    // Store start[0] and self[0] in the exported buffer.
+    store_ts(&tsc_start, ts_slot(0, 0));
+    store_ts(&tsc_self,  ts_slot(0, 3));
+
+    @activate(cons.task_bootstrap_id);
+}
+
+// ===========================================================
+// SECTION 10 — COMPTIME BINDINGS
+// ===========================================================
+
+comptime {
+    @bind_local_task(task_bootstrap,         cons.task_bootstrap_id);
+    @bind_local_task(task_rx_fwd_complete,   cons.task_rx_fwd_complete_id);
+    @bind_local_task(task_rx_bwd_complete,   cons.task_rx_bwd_complete_id);
+    @bind_local_task(task_tx_fwd_complete,   cons.task_tx_fwd_complete_id);
+    @bind_local_task(task_tx_bwd_complete,   cons.task_tx_bwd_complete_id);
+    @bind_local_task(task_integrate,         cons.task_integrate_id);
+    @bind_local_task(task_finalize,          cons.task_finalize_id);
+
+    if (@is_arch("wse3")) {
+        if (has_fwd_in == 1) {
+            @initialize_queue(cons.fwd_in_iq, .{ .color = color_fwd_in });
+        }
+        if (has_fwd_out == 1) {
+            @initialize_queue(cons.fwd_out_oq, .{ .color = color_fwd_out });
+        }
+        if (has_bwd_in == 1) {
+            @initialize_queue(cons.bwd_in_iq, .{ .color = color_bwd_in });
+        }
+        if (has_bwd_out == 1) {
+            @initialize_queue(cons.bwd_out_oq, .{ .color = color_bwd_out });
+        }
+    }
+
+    @export_symbol(local_particles_ptr, "ptr_local_particles");
+    @export_symbol(local_forces_ptr,    "ptr_local_forces");
+    @export_symbol(done_ptr,            "ptr_done");
+    @export_symbol(n_pred_fwd_ptr,      "ptr_n_pred_fwd");
+    @export_symbol(n_pred_bwd_ptr,      "ptr_n_pred_bwd");
+    @export_symbol(time_buf_u16_ptr,    "ptr_time_buf_u16");
+    @export_symbol(compute_step);
+}

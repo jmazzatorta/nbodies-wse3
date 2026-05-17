@@ -1,0 +1,99 @@
+// constants.csl
+// Shared constants and task IDs for the WSE-3 N-body simulation.
+//
+// === DESIGN: WORMHOLE ROUTING WITH ALTERNATING COLORS ===
+//
+// We use 4 colors total:
+//   FWD_A, FWD_B: alternating colors for the FWD ring stream.
+//   BWD_A, BWD_B: alternating colors for the BWD ring stream.
+//
+// For the FWD stream, each PE has a position k in the ring (0..L-1).
+// Its outgoing color is FWD_A if k is even, FWD_B if k is odd. Its
+// incoming color is the opposite (== outgoing color of its predecessor,
+// which is k-1).
+//
+// Routing on each color is either:
+//   - "drainer" (rx = predecessor_dir, tx = RAMP) -- chunk arrives at CE.
+//   - "emitter" (rx = RAMP, tx = successor_dir)   -- CE emits chunk.
+//
+// The CE explicitly performs drain + re-emit: it drains a chunk on
+// in_color, then re-emits it on out_color. After draining all
+// predecessor chunks, the CE emits its OWN chunk on out_color.
+//
+// No fork-routing, no switches, no control wavelets.
+
+// ----------------- IMPORTED PARAMETERS -----------------
+param side          : u16;     // 32, 64, 128 (PE per side)
+param N_LOCAL       : u16;     // 1, 2, 4, 8, 16 (bodies per PE)
+
+// Multistep parameters (set at compile time via --params).
+// cslc only accepts integer values for --params, so DT is passed as
+// numerator/denominator and reconstructed at compile time.
+param N_STEPS : u16;     // number of leapfrog integration steps
+param DT_NUM  : u32;     // numerator of timestep
+param DT_DEN  : u32;     // denominator of timestep (e.g. DT_NUM=1, DT_DEN=10000 -> DT=0.0001)
+
+// Derived: grid_side and DT/HALF_DT.
+const grid_side : u16 = side;
+const DT      : f32 = @as(f32, DT_NUM) / @as(f32, DT_DEN);
+const HALF_DT : f32 = DT * 0.5;
+
+// ----------------- PHYSICS -----------------
+const SOFT_EPS_SQ : f32 = 0.0001;
+const G_GRAV      : f32 = 1.0;
+
+// ----------------- BUFFER LAYOUT -----------------
+const PARTICLE_FULL_SIZE    : u16 = 7;     // [x,y,z,vx,vy,vz,m]
+const PARTICLE_COMPACT_SIZE : u16 = 4;     // [x,y,z,m]
+const FORCE_SIZE : u16 = 3;
+const CHUNK_SIZE : u16 = N_LOCAL * PARTICLE_COMPACT_SIZE;     // 64
+
+// ----------------- RING -----------------
+const RING_LENGTH : u16 = grid_side * grid_side;     // 1024
+const TOTAL_CHUNKS_TO_RX : u16 = RING_LENGTH - 1;     // 1023
+
+// ----------------- ROUTING COLORS (FROM LAYOUT) -----------------
+// Each PE receives its specific in/out colors as comptime params.
+// At most 4 colors; some PEs (origin/terminus) only use a subset.
+param color_fwd_in  : color;     // in-color for the FWD stream
+param color_fwd_out : color;     // out-color for the FWD stream
+param color_bwd_in  : color;     // in-color for the BWD stream
+param color_bwd_out : color;     // out-color for the BWD stream
+
+// Whether each color is actually used by this PE.
+//   - FWD origin (ring_pos=0):     no fwd_in.
+//   - FWD terminus (ring_pos=L-1): no fwd_out.
+//   - BWD origin (ring_pos=L-1):   no bwd_in.
+//   - BWD terminus (ring_pos=0):   no bwd_out.
+param has_fwd_in  : u16;     // 1 if PE has incoming FWD chunks, 0 otherwise
+param has_fwd_out : u16;     // 1 if PE emits on FWD, 0 otherwise
+param has_bwd_in  : u16;     // 1 if PE has incoming BWD chunks
+param has_bwd_out : u16;     // 1 if PE emits on BWD
+
+// ----------------- INPUT/OUTPUT QUEUES -----------------
+// Memcpy reserves iq[0], iq[1].
+//   FWD drain: iq[2]
+//   BWD drain: iq[3]
+//   FWD emit:  oq[6]
+//   BWD emit:  oq[7]
+const fwd_in_iq   : input_queue  = @get_input_queue(2);
+const bwd_in_iq   : input_queue  = @get_input_queue(3);
+const fwd_out_oq  : output_queue = @get_output_queue(6);
+const bwd_out_oq  : output_queue = @get_output_queue(7);
+
+// ----------------- LOCAL TASK IDs -----------------
+const task_bootstrap_id       : local_task_id = @get_local_task_id(8);
+
+// FWD stream tasks
+const task_rx_fwd_complete_id : local_task_id = @get_local_task_id(10);
+const task_tx_fwd_complete_id : local_task_id = @get_local_task_id(11);
+
+// BWD stream tasks
+const task_rx_bwd_complete_id : local_task_id = @get_local_task_id(12);
+const task_tx_bwd_complete_id : local_task_id = @get_local_task_id(13);
+
+// Final teardown
+const task_finalize_id : local_task_id = @get_local_task_id(14);
+
+// Multistep: integrate (update positions/velocities + decide next step)
+const task_integrate_id : local_task_id = @get_local_task_id(15);

@@ -1,0 +1,224 @@
+// layout.csl
+// Direct N-Body O(N^2) simulation on Cerebras WSE-3.
+//
+// === DESIGN: WORMHOLE ROUTING WITH ALTERNATING COLORS ===
+//
+// The PEs form an open ring through a serpentine row-major path on a
+// 32x32 fabric. Each PE has a position k in the ring (0..1023).
+//
+// Two streams flow in opposite directions:
+//   FWD: ring_pos increasing (origin = (0,0), terminus = (0,31)).
+//   BWD: ring_pos decreasing (origin = (0,31), terminus = (0,0)).
+//
+// Each stream uses TWO alternating colors (A, B). The routing on each
+// color is either "drainer" (rx=predecessor_dir, tx=RAMP) or "emitter"
+// (rx=RAMP, tx=successor_dir). Per PE, exactly one of the two stream
+// colors plays each role, and they alternate so that the same PE can
+// drain on one color and emit on the other without routing conflicts.
+//
+// The CE explicitly drains a chunk on the in-color and re-emits it on
+// the out-color. After draining all predecessor chunks, the CE emits
+// its own chunk. Same logic mirrors for the BWD stream.
+
+// ----------------- HOST PARAMETERS -----------------
+param side          : u16;     // 32, 64, 128 (PE per side)
+param N_LOCAL       : u16;     // 1, 2, 4, 8, 16
+param N_STEPS       : u16;     // number of leapfrog integration steps
+param DT_NUM        : u32;     // numerator of timestep
+param DT_DEN        : u32;     // denominator of timestep
+
+param MEMCPY_H2D_ID : i16;
+param MEMCPY_D2H_ID : i16;
+
+const grid_side : u16 = side;
+
+const color_memcpy_h2d = @get_color(MEMCPY_H2D_ID);
+const color_memcpy_d2h = @get_color(MEMCPY_D2H_ID);
+
+const memcpy_mod = @import_module("<memcpy/get_params>", .{
+    .width       = grid_side,
+    .height      = grid_side,
+    .MEMCPYH2D_1 = color_memcpy_h2d,
+    .MEMCPYD2H_1 = color_memcpy_d2h,
+});
+
+// ----------------- ROUTING COLORS -----------------
+// All four colors must be in the WSE-3 switches-supported set
+// (3, 4, 5, 6, 7, 8, 9, 12, 13, 16, 17, 20, 21). We don't actually use
+// switches in this design but pick from the same set for safety.
+const FWD_A = @get_color(3);
+const FWD_B = @get_color(4);
+const BWD_A = @get_color(5);
+const BWD_B = @get_color(6);
+
+// =================================================================
+// HELPERS: serpentine geometry
+// =================================================================
+
+// ring_pos(px, py) returns the position of PE (px, py) in the
+// serpentine ring (0..L-1). Even rows go EAST; odd rows go WEST.
+fn ring_pos_of(comptime px: u16, comptime py: u16) u16 {
+    if (py % 2 == 0) {
+        return py * grid_side + px;
+    } else {
+        return py * grid_side + (grid_side - 1 - px);
+    }
+}
+
+// fwd_out_dir(px, py) returns the direction of the FWD successor
+// (where this PE sends its FWD chunk). Only defined if has_fwd_out.
+fn fwd_out_dir_of(comptime px: u16, comptime py: u16) direction {
+    const is_even_row = (py % 2 == 0);
+    const at_east_edge = (px == grid_side - 1);
+    const at_west_edge = (px == 0);
+
+    if (is_even_row) {
+        if (at_east_edge) {
+            // End of even row: turn SOUTH.
+            return SOUTH;
+        } else {
+            return EAST;
+        }
+    } else {
+        if (at_west_edge) {
+            // End of odd row: turn SOUTH.
+            return SOUTH;
+        } else {
+            return WEST;
+        }
+    }
+}
+
+// fwd_in_dir(px, py) returns the direction of the FWD predecessor
+// (where the FWD chunk arrives from). Only defined if has_fwd_in.
+fn fwd_in_dir_of(comptime px: u16, comptime py: u16) direction {
+    const is_even_row = (py % 2 == 0);
+    const at_west_edge = (px == 0);
+    const at_east_edge = (px == grid_side - 1);
+
+    if (is_even_row) {
+        if (at_west_edge) {
+            // First cell of even row (not (0,0)): predecessor is the
+            // last cell of the previous (odd) row, which has px=0.
+            // Predecessor is at (0, py-1) = NORTH.
+            return NORTH;
+        } else {
+            return WEST;
+        }
+    } else {
+        if (at_east_edge) {
+            // First cell of odd row: predecessor is the last cell of
+            // the previous (even) row, which has px=grid_side-1.
+            // Predecessor is at (grid_side-1, py-1) = NORTH.
+            return NORTH;
+        } else {
+            return EAST;
+        }
+    }
+}
+
+// =================================================================
+// HELPERS: routing config builders
+// =================================================================
+
+// Drainer: receive chunks from in_dir, deliver to CE.
+fn drainer_cfg(comptime in_dir: direction) comptime_struct {
+    return .{ .routes = .{ .rx = .{in_dir}, .tx = .{RAMP} } };
+}
+
+// Emitter: CE emits, send chunks to out_dir.
+fn emitter_cfg(comptime out_dir: direction) comptime_struct {
+    return .{ .routes = .{ .rx = .{RAMP}, .tx = .{out_dir} } };
+}
+
+// =================================================================
+// LAYOUT
+// =================================================================
+layout {
+    @set_rectangle(grid_side, grid_side);
+
+    for (@range(u16, grid_side)) |py| {
+        for (@range(u16, grid_side)) |px| {
+            const k         : u16 = ring_pos_of(px, py);
+            const k_bwd     : u16 = (grid_side * grid_side - 1) - k;
+
+            const is_fwd_origin   : bool = (k == 0);
+            const is_fwd_terminus : bool = (k == grid_side * grid_side - 1);
+            const is_bwd_origin   : bool = is_fwd_terminus;
+            const is_bwd_terminus : bool = is_fwd_origin;
+
+            const has_fwd_in  : u16 = if (is_fwd_origin)   0 else 1;
+            const has_fwd_out : u16 = if (is_fwd_terminus) 0 else 1;
+            const has_bwd_in  : u16 = if (is_bwd_origin)   0 else 1;
+            const has_bwd_out : u16 = if (is_bwd_terminus) 0 else 1;
+
+            // FWD colors. Out-color of PE at ring pos k is FWD_A if k
+            // even, FWD_B if k odd. In-color is the opposite.
+            const fwd_out_color = if (k % 2 == 0) FWD_A else FWD_B;
+            const fwd_in_color  = if (k % 2 == 0) FWD_B else FWD_A;
+
+            // BWD colors, indexed by ring_pos_bwd.
+            const bwd_out_color = if (k_bwd % 2 == 0) BWD_A else BWD_B;
+            const bwd_in_color  = if (k_bwd % 2 == 0) BWD_B else BWD_A;
+
+            // Set tile code with all the params the PE needs.
+            @set_tile_code(px, py, "pe.csl", .{
+                .side            = side,
+                .N_LOCAL         = N_LOCAL,
+                .N_STEPS         = N_STEPS,
+                .DT_NUM          = DT_NUM,
+                .DT_DEN          = DT_DEN,
+                .pe_x            = px,
+                .pe_y            = py,
+                .color_fwd_in    = fwd_in_color,
+                .color_fwd_out   = fwd_out_color,
+                .color_bwd_in    = bwd_in_color,
+                .color_bwd_out   = bwd_out_color,
+                .has_fwd_in      = has_fwd_in,
+                .has_fwd_out     = has_fwd_out,
+                .has_bwd_in      = has_bwd_in,
+                .has_bwd_out     = has_bwd_out,
+                .memcpy_params   = memcpy_mod.get_params(px),
+            });
+
+            // ----- Set routing config for each color the PE uses -----
+            // FWD in: drainer on fwd_in_color, rx = fwd_in_dir.
+            if (has_fwd_in == 1) {
+                const dir = fwd_in_dir_of(px, py);
+                @set_color_config(px, py, fwd_in_color, drainer_cfg(dir));
+            }
+            // FWD out: emitter on fwd_out_color, tx = fwd_out_dir.
+            if (has_fwd_out == 1) {
+                const dir = fwd_out_dir_of(px, py);
+                @set_color_config(px, py, fwd_out_color, emitter_cfg(dir));
+            }
+            // BWD in: drainer on bwd_in_color, rx = bwd_in_dir.
+            //   bwd_in_dir = direction of FWD successor = fwd_out_dir.
+            if (has_bwd_in == 1) {
+                const dir = fwd_out_dir_of(px, py);
+                @set_color_config(px, py, bwd_in_color, drainer_cfg(dir));
+            }
+            // BWD out: emitter on bwd_out_color, tx = bwd_out_dir.
+            //   bwd_out_dir = direction of FWD predecessor = fwd_in_dir.
+            if (has_bwd_out == 1) {
+                const dir = fwd_in_dir_of(px, py);
+                @set_color_config(px, py, bwd_out_color, emitter_cfg(dir));
+            }
+        }
+    }
+
+    // ----------------- HOST EXPORTS -----------------
+    @export_name("compute_step", fn()void);
+
+    @export_name("ptr_local_particles", [*]f32, true);  // x,y,z,vx,vy,vz,m per particle (length N_LOCAL*7)
+    @export_name("ptr_local_forces",    [*]f32, true);  // fx,fy,fz per particle      (length N_LOCAL*3)
+    @export_name("ptr_done",            [*]u32, true);
+
+    // Per-PE ring topology (precomputed by host)
+    @export_name("ptr_n_pred_fwd", [*]u32, true);  // number of FWD predecessor chunks to drain
+    @export_name("ptr_n_pred_bwd", [*]u32, true);  // number of BWD predecessor chunks to drain
+
+    // Timing buffer (9 u16 per step * (N_STEPS+1) iterations of task_integrate).
+    // Each iteration s stores: [tsc_start[s] (3 u16), tsc_self[s] (3 u16), tsc_end[s] (3 u16)].
+    @export_name("ptr_time_buf_u16",    [*]u16, true);
+}
