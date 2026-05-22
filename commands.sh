@@ -8,11 +8,6 @@
 #   ./commands.sh 32 1 10 1 10000      # 32x32, 1 body/PE, 10 steps, dt=0.0001
 #   ./commands.sh 32 4 100 1 10000     # 32x32, 4 bodies/PE, 100 steps, dt=0.0001
 #   ./commands.sh 64 16 50 5 10000     # 64x64, 16 bodies/PE, 50 steps, dt=0.0005
-#
-# Notes:
-#   - On simulated fabric, fabric-dims must be at least (side+7, side+2).
-#   - On real CS-3, override via CS_FABRIC_DIMS, e.g.:
-#       export CS_FABRIC_DIMS=757,996  # WSE-2 fabric (placeholder; check your system)
 
 export PATH="$HOME/Documents/thesis/sdk:$PATH"
 set -e
@@ -24,6 +19,7 @@ DT_NUM="${4:-1}"
 DT_DEN="${5:-10000}"
 
 # Simulator fabric dimensions: side + memcpy overhead.
+# On real CS-3 override via CS_FABRIC_DIMS
 SIMFAB_X=$((SIDE + 7))
 SIMFAB_Y=$((SIDE + 2))
 FABRIC_DIMS=${CS_FABRIC_DIMS:-${SIMFAB_X},${SIMFAB_Y}}
